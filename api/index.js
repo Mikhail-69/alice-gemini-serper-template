@@ -1,15 +1,16 @@
 const DEFAULT_MODEL = "gemini-3.6-flash";
 const FALLBACK_MODELS = ["gemini-3.8-flash", "gemini-3.5-flash-lite"];
 const MAX_OUTPUT_TOKENS = 400;
-const THINKING_LEVEL = "low";
+const THINKING_LEVEL_HISTORY = "low";
+const THINKING_LEVEL_SINGLE = "minimal";
 // Free-tier rate limits are tracked per model, so a 429 is worth retrying elsewhere.
 const RETRYABLE_STATUSES = new Set([404, 429, 500, 502, 503, 504]);
 const MAX_HISTORY_MESSAGES = 8;
 const MAX_HISTORY_MESSAGE_CHARS = 1200;
 const MAX_ALICE_TEXT = 1024;
-const TOTAL_RESPONSE_BUDGET_MS = 3200;
+const TOTAL_RESPONSE_BUDGET_MS = 3400;
 const SERPER_TIMEOUT_MS = 650;
-const GEMINI_TIMEOUT_MS = 2300;
+const GEMINI_TIMEOUT_MS = 2600;
 
 const SYSTEM_PROMPT = [
   "Ты — умная Алиса. Отвечай голосом: по-русски, 1–3 коротких предложения, без списков, таблиц и разметки.",
@@ -170,13 +171,17 @@ async function askGemini(text, history, searchContext, timeoutMs, stats) {
 
   // Thinking is on by default in Gemini 3 and shares maxOutputTokens with the answer,
   // so a small cap silently truncates the reply down to a stub.
+  // Minimal thinking answers a fresh question in under a second. Follow-ups stay on
+  // low because minimal needs thought signatures we do not persist between turns.
+  const thinkingLevel = contents.length > 1 ? THINKING_LEVEL_HISTORY : THINKING_LEVEL_SINGLE;
+
   const buildBody = thinking => JSON.stringify({
     systemInstruction: { parts: [{ text: SYSTEM_PROMPT }] },
     contents,
     generationConfig: {
       temperature: 0.5,
       maxOutputTokens: MAX_OUTPUT_TOKENS,
-      ...(thinking ? { thinkingConfig: { thinkingLevel: THINKING_LEVEL } } : {})
+      ...(thinking ? { thinkingConfig: { thinkingLevel } } : {})
     }
   });
 
@@ -268,7 +273,7 @@ async function askGemini(text, history, searchContext, timeoutMs, stats) {
       if (stats) {
         stats.geminiMs = spent();
         stats.model = model;
-        stats.thinkingLevel = thinking ? THINKING_LEVEL : "off";
+        stats.thinkingLevel = thinking ? thinkingLevel : "off";
       }
       return attempt.answer;
     }
