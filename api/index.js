@@ -13,7 +13,7 @@ const SERPER_TIMEOUT_MS = 650;
 const GEMINI_TIMEOUT_MS = 1800;
 const AI_TIMEOUT_MS = 1100;
 const DEFAULT_AI_BASE_URL = "https://api.groq.com/openai/v1";
-const DEFAULT_AI_MODEL = "llama-3.3-70b-versatile";
+const DEFAULT_AI_MODEL = "openai/gpt-oss-20b";
 
 const SYSTEM_PROMPT = [
   "Ты — умная Алиса. Отвечай голосом: по-русски, 1–3 коротких предложения, без списков, таблиц и разметки.",
