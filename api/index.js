@@ -1,14 +1,15 @@
 const DEFAULT_MODEL = "gemini-3.6-flash";
 const FALLBACK_MODELS = ["gemini-3.8-flash", "gemini-3.5-flash-lite"];
-const MAX_OUTPUT_TOKENS = 600;
-const THINKING_LEVEL = "low";
+const MAX_OUTPUT_TOKENS = 400;
+const THINKING_LEVEL_HISTORY = "low";
+const THINKING_LEVEL_SINGLE = "minimal";
 const RETRYABLE_STATUSES = new Set([404, 500, 502, 503, 504]);
 const MAX_HISTORY_MESSAGES = 8;
 const MAX_HISTORY_MESSAGE_CHARS = 1200;
 const MAX_ALICE_TEXT = 1024;
-const TOTAL_RESPONSE_BUDGET_MS = 4100;
+const TOTAL_RESPONSE_BUDGET_MS = 4300;
 const SERPER_TIMEOUT_MS = 650;
-const GEMINI_TIMEOUT_MS = 3000;
+const GEMINI_TIMEOUT_MS = 3400;
 
 const SYSTEM_PROMPT = [
   "Ты — умная Алиса. Отвечай голосом: по-русски, 1–3 коротких предложения, без списков, таблиц и разметки.",
@@ -75,9 +76,11 @@ async function fetchJson(url, options, timeoutMs) {
   }
 }
 
-async function searchWeb(query, timeoutMs) {
+async function searchWeb(query, timeoutMs, stats) {
   const key = process.env.SERPER_API_KEY;
   if (!key || timeoutMs < 150) return "";
+
+  const searchStartedAt = Date.now();
 
   try {
     const { response, data } = await fetchJson(
@@ -97,6 +100,8 @@ async function searchWeb(query, timeoutMs) {
       console.warn("Serper request failed with HTTP", response.status);
       return "";
     }
+
+    if (stats) stats.searchMs = Date.now() - searchStartedAt;
 
     const items = (Array.isArray(data.organic) ? data.organic : [])
       .slice(0, 3)
@@ -123,7 +128,7 @@ function modelChain() {
     .filter((model, index, list) => list.indexOf(model) === index);
 }
 
-async function askGemini(text, history, searchContext, timeoutMs) {
+async function askGemini(text, history, searchContext, timeoutMs, stats) {
   const key = process.env.GEMINI_API_KEY;
   if (!key) throw new Error("MISSING_GEMINI_KEY");
   if (timeoutMs < 250) throw new Error("TIME_BUDGET_EXHAUSTED");
@@ -143,13 +148,17 @@ async function askGemini(text, history, searchContext, timeoutMs) {
 
   // Thinking is on by default in Gemini 3 and shares maxOutputTokens with the answer,
   // so a small cap silently truncates the reply down to a stub.
+  // Single-turn questions can think minimally; follow-ups need thought signatures,
+  // which we do not store, so they stay on the low level.
+  const thinkingLevel = contents.length > 1 ? THINKING_LEVEL_HISTORY : THINKING_LEVEL_SINGLE;
+
   const buildBody = thinking => JSON.stringify({
     systemInstruction: { parts: [{ text: SYSTEM_PROMPT }] },
     contents,
     generationConfig: {
       temperature: 0.5,
       maxOutputTokens: MAX_OUTPUT_TOKENS,
-      ...(thinking ? { thinkingConfig: { thinkingLevel: THINKING_LEVEL } } : {})
+      ...(thinking ? { thinkingConfig: { thinkingLevel } } : {})
     }
   });
 
@@ -216,6 +225,11 @@ async function askGemini(text, history, searchContext, timeoutMs) {
       if (!answer) {
         if (data?.promptFeedback?.blockReason) throw new Error("GEMINI_BLOCKED");
         throw new Error("GEMINI_EMPTY_RESPONSE");
+      }
+      if (stats) {
+        stats.geminiMs = Date.now() - startedAt;
+        stats.model = model;
+        stats.thinkingLevel = thinking ? thinkingLevel : "off";
       }
       return answer;
     }
@@ -287,18 +301,21 @@ export default async function handler(req, res) {
     ));
   }
 
+  const stats = {};
+
   try {
     let searchContext = "";
     if (isSearchIntent(text) && process.env.SERPER_API_KEY) {
       // Search has a very short budget because Alice expects a response within 4.5 seconds.
-      searchContext = await searchWeb(text, Math.min(SERPER_TIMEOUT_MS, Math.max(0, remainingMs() - 2600)));
+      searchContext = await searchWeb(text, Math.min(SERPER_TIMEOUT_MS, Math.max(0, remainingMs() - 2600)), stats);
     }
 
     const answer = await askGemini(
       text,
       oldHistory,
       searchContext,
-      Math.max(0, Math.min(GEMINI_TIMEOUT_MS, remainingMs() - 600))
+      Math.max(0, Math.min(GEMINI_TIMEOUT_MS, remainingMs() - 600)),
+      stats
     );
 
     const history = [
@@ -307,13 +324,21 @@ export default async function handler(req, res) {
       { role: "model", text: answer.slice(0, MAX_HISTORY_MESSAGE_CHARS) }
     ].slice(-MAX_HISTORY_MESSAGES);
 
+    res.setHeader(
+      "X-Alice-Timing",
+      `search=${stats.searchMs ?? 0}ms gemini=${stats.geminiMs ?? 0}ms model=${stats.model ?? "none"} thinking=${stats.thinkingLevel ?? "n\/a"} total=${Date.now() - startedAt}ms`
+    );
     return res.status(200).json(aliceResponse(answer, false, history));
   } catch (error) {
     // Keep a real Error object here: a bare string would break the mapping in errorForUser.
     const safeError = error?.name === "AbortError" || error?.message === "AbortError"
       ? Object.assign(new Error("TIME_BUDGET_EXHAUSTED"), { detail: "превышено время ответа" })
       : error;
-    console.warn("Alice webhook returned a fallback response:", safeError?.message || "unknown error");
+    console.warn(
+      "Alice webhook returned a fallback response:",
+      safeError?.message || "unknown error",
+      `search=${stats.searchMs ?? 0}ms gemini=${stats.geminiMs ?? 0}ms model=${stats.model ?? "none"}`
+    );
     return res.status(200).json(aliceResponse(errorForUser(safeError), false, oldHistory));
   }
 }
