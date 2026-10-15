@@ -3,7 +3,8 @@ const FALLBACK_MODELS = ["gemini-3.8-flash", "gemini-3.5-flash-lite"];
 const MAX_OUTPUT_TOKENS = 400;
 const THINKING_LEVEL_HISTORY = "low";
 const THINKING_LEVEL_SINGLE = "minimal";
-const RETRYABLE_STATUSES = new Set([404, 500, 502, 503, 504]);
+// Free-tier rate limits are tracked per model, so a 429 is worth retrying elsewhere.
+const RETRYABLE_STATUSES = new Set([404, 429, 500, 502, 503, 504]);
 const MAX_HISTORY_MESSAGES = 8;
 const MAX_HISTORY_MESSAGE_CHARS = 1200;
 const MAX_ALICE_TEXT = 1024;
@@ -238,11 +239,12 @@ async function askGemini(text, history, searchContext, timeoutMs, stats) {
     const detail = String(data?.error?.message || "").slice(0, 200);
     console.error("Gemini request failed with HTTP", status, "on model", model, detail);
     if (status === 401 || status === 403) throw new Error("GEMINI_KEY_REJECTED");
-    if (status === 429) throw new Error("GEMINI_QUOTA");
 
-    lastError = Object.assign(new Error("GEMINI_REQUEST_FAILED"), {
-      detail: `HTTP ${status} на ${model}${detail ? `: ${detail}` : ""}`
-    });
+    lastError = status === 429
+      ? new Error("GEMINI_QUOTA")
+      : Object.assign(new Error("GEMINI_REQUEST_FAILED"), {
+          detail: `HTTP ${status} на ${model}${detail ? `: ${detail}` : ""}`
+        });
 
     // Overloaded or temporarily unavailable model: try the next one in the chain.
     if (!RETRYABLE_STATUSES.has(status)) break;
