@@ -202,12 +202,14 @@ async function askGemini(text, history, searchContext, timeoutMs, stats) {
   let thinking = true;
   let budget = timeoutMs;
   let lastError;
+  const tried = [];
 
   for (const model of models) {
     const startedAt = Date.now();
     const spent = () => Date.now() - startedAt;
     const limit = () => Math.min(GEMINI_TIMEOUT_MS, Math.max(0, budget - spent()));
 
+    tried.push(model);
     let attempt = await call(model, thinking, limit());
 
     // One retry without the thinking config in case this model rejects the field.
@@ -220,6 +222,11 @@ async function askGemini(text, history, searchContext, timeoutMs, stats) {
     budget -= spent();
     if (attempt.timeout) {
       lastError = timedOut(model);
+      if (stats) {
+        stats.tried = tried.join(">");
+        stats.lastStatus = "timeout";
+        stats.lastDetail = `${model} не ответил за ${Math.round(spent())}ms`;
+      }
       budget = 0;
       break;
     }
@@ -243,6 +250,7 @@ async function askGemini(text, history, searchContext, timeoutMs, stats) {
       if (stats) {
         stats.geminiMs = Date.now() - startedAt;
         stats.model = model;
+        stats.tried = tried.join(">");
         stats.thinkingLevel = thinking ? thinkingLevel : "off";
       }
       return answer;
@@ -250,6 +258,11 @@ async function askGemini(text, history, searchContext, timeoutMs, stats) {
 
     const status = Number(response.status);
     const detail = String(data?.error?.message || "").slice(0, 200);
+    if (stats) {
+      stats.tried = tried.join(">");
+      stats.lastStatus = status;
+      stats.lastDetail = detail;
+    }
     console.error("Gemini request failed with HTTP", status, "on model", model, detail);
     if (status === 401 || status === 403) throw new Error("GEMINI_KEY_REJECTED");
 
@@ -356,7 +369,7 @@ export default async function handler(req, res) {
     );
     res.setHeader(
       "X-Alice-Timing",
-      `search=${stats.searchMs ?? 0}ms gemini=${stats.geminiMs ?? 0}ms model=${stats.model ?? "none"} thinking=${stats.thinkingLevel ?? "n/a"} total=${Date.now() - startedAt}ms`
+      `search=${stats.searchMs ?? 0}ms gemini=${stats.geminiMs ?? 0}ms tried=${stats.tried ?? "none"} status=${stats.lastStatus ?? "-"} thinking=${stats.thinkingLevel ?? "n/a"} total=${Date.now() - startedAt}ms err=${safeError?.message ?? "?"} detail=${(stats.lastDetail ?? "").slice(0, 120)}`
     );
     return res.status(200).json(aliceResponse(errorForUser(safeError), false, oldHistory));
   }
