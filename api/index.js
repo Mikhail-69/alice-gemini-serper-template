@@ -10,7 +10,10 @@ const MAX_HISTORY_MESSAGE_CHARS = 1200;
 const MAX_ALICE_TEXT = 1024;
 const TOTAL_RESPONSE_BUDGET_MS = 3400;
 const SERPER_TIMEOUT_MS = 650;
-const GEMINI_TIMEOUT_MS = 2600;
+const GEMINI_TIMEOUT_MS = 1800;
+const AI_TIMEOUT_MS = 1100;
+const DEFAULT_AI_BASE_URL = "https://api.groq.com/openai/v1";
+const DEFAULT_AI_MODEL = "llama-3.3-70b-versatile";
 
 const SYSTEM_PROMPT = [
   "Ты — умная Алиса. Отвечай голосом: по-русски, 1–3 коротких предложения, без списков, таблиц и разметки.",
@@ -141,7 +144,9 @@ function timingHeader(stats, totalMs, errorMessage) {
     `total=${totalMs}ms`,
     `search=${stats.searchMs ?? 0}ms`,
     `gemini=${stats.geminiMs ?? 0}ms`,
+    `ai=${stats.aiMs ?? 0}ms`,
     `tried=${stats.tried ?? "none"}`,
+    `provider=${stats.provider ?? "none"}`,
     `status=${stats.lastStatus ?? "-"}`,
     `thinking=${stats.thinkingLevel ?? "n/a"}`
   ];
@@ -300,10 +305,94 @@ async function askGemini(text, history, searchContext, timeoutMs, stats) {
   throw lastError || new Error("GEMINI_REQUEST_FAILED");
 }
 
+function aiConfig() {
+  const key = String(process.env.AI_API_KEY || "").trim();
+  const baseUrl = String(process.env.AI_BASE_URL || DEFAULT_AI_BASE_URL).trim().replace(/\/+$/, "");
+  const model = String(process.env.AI_MODEL || DEFAULT_AI_MODEL).trim();
+  return { key, baseUrl, model };
+}
+
+async function askCompatibleAI(text, history, searchContext, timeoutMs, stats) {
+  const { key, baseUrl, model } = aiConfig();
+  if (!key) throw new Error("MISSING_AI_KEY");
+  if (!/^https:\/\//i.test(baseUrl) || !/^[A-Za-z0-9._:-]+$/.test(model)) {
+    throw new Error("INVALID_AI_CONFIG");
+  }
+  if (timeoutMs < 250) throw new Error("TIME_BUDGET_EXHAUSTED");
+
+  const prompt = searchContext
+    ? `${text}\n\nРезультаты поиска в интернете:\n${searchContext}\nИспользуй их только там, где они относятся к вопросу.`
+    : text;
+  const messages = [
+    { role: "system", content: SYSTEM_PROMPT },
+    ...safeHistory(history).map(item => ({
+      role: item.role === "model" ? "assistant" : "user",
+      content: item.text
+    })),
+    { role: "user", content: prompt }
+  ];
+  const startedAt = Date.now();
+
+  try {
+    const { response, data } = await fetchJson(
+      `${baseUrl}/chat/completions`,
+      {
+        method: "POST",
+        headers: {
+          "Authorization": `Bearer ${key}`,
+          "Content-Type": "application/json"
+        },
+        body: JSON.stringify({
+          model,
+          messages,
+          temperature: 0.5,
+          max_tokens: MAX_OUTPUT_TOKENS
+        })
+      },
+      timeoutMs
+    );
+
+    if (stats) {
+      stats.aiMs = Date.now() - startedAt;
+      stats.aiModel = model;
+      stats.lastStatus = response.status;
+      stats.lastDetail = String(data?.error?.message || "").slice(0, 200);
+    }
+    if (!response.ok) {
+      if (response.status === 401 || response.status === 403) throw new Error("AI_KEY_REJECTED");
+      throw Object.assign(new Error("AI_REQUEST_FAILED"), {
+        detail: `HTTP ${response.status}${data?.error?.message ? `: ${String(data.error.message).slice(0, 160)}` : ""}`
+      });
+    }
+
+    const answer = String(data?.choices?.[0]?.message?.content || "").trim();
+    if (!answer || looksBroken(answer)) throw new Error("AI_EMPTY_RESPONSE");
+    if (stats) stats.provider = "ai";
+    return answer;
+  } catch (error) {
+    if (error?.name === "AbortError") {
+      const timeoutError = Object.assign(new Error("TIME_BUDGET_EXHAUSTED"), {
+        detail: "резервный провайдер не ответил за отведённое время"
+      });
+      if (stats) {
+        stats.aiMs = Date.now() - startedAt;
+        stats.lastStatus = "ai-timeout";
+        stats.lastDetail = timeoutError.detail;
+      }
+      throw timeoutError;
+    }
+    throw error;
+  }
+}
+
 function errorForUser(error) {
   switch (error?.message) {
     case "MISSING_GEMINI_KEY":
       return "Сервер пока не настроен. Проверьте переменную GEMINI_API_KEY в настройках Vercel.";
+    case "MISSING_AI_KEY":
+      return "Сервер пока не настроен. Проверьте резервный API-ключ в настройках Vercel.";
+    case "AI_KEY_REJECTED":
+      return "Не удалось подключиться к резервной нейросети. Проверьте API-ключ в настройках Vercel.";
     case "GEMINI_KEY_REJECTED":
       return "Не удалось подключиться к Gemini. Проверьте API-ключ в настройках Vercel.";
     case "GEMINI_QUOTA":
@@ -358,13 +447,35 @@ export default async function handler(req, res) {
       searchContext = await searchWeb(text, Math.min(SERPER_TIMEOUT_MS, Math.max(0, remainingMs() - 2200)), stats);
     }
 
-    const answer = await askGemini(
-      text,
-      oldHistory,
-      searchContext,
-      Math.max(0, Math.min(GEMINI_TIMEOUT_MS, remainingMs() - 300)),
-      stats
-    );
+    let answer;
+    try {
+      answer = await askGemini(
+        text,
+        oldHistory,
+        searchContext,
+        Math.max(0, Math.min(GEMINI_TIMEOUT_MS, remainingMs() - 300)),
+        stats
+      );
+      stats.provider = "gemini";
+    } catch (geminiError) {
+      if (!process.env.AI_API_KEY || remainingMs() < 250) throw geminiError;
+      console.warn("Gemini failed; trying the OpenAI-compatible fallback.", geminiError.message);
+      try {
+        answer = await askCompatibleAI(
+          text,
+          oldHistory,
+          searchContext,
+          Math.max(0, Math.min(AI_TIMEOUT_MS, remainingMs() - 150)),
+          stats
+        );
+      } catch (aiError) {
+        // Preserve the more useful Gemini error when the fallback is unavailable or also fails.
+        if (aiError?.message === "TIME_BUDGET_EXHAUSTED" || aiError?.message === "MISSING_AI_KEY") {
+          throw geminiError;
+        }
+        throw aiError;
+      }
+    }
 
     const history = [
       ...oldHistory,
@@ -382,11 +493,11 @@ export default async function handler(req, res) {
     console.warn(
       "Alice webhook returned a fallback response:",
       safeError?.message || "unknown error",
-      `search=${stats.searchMs ?? 0}ms gemini=${stats.geminiMs ?? 0}ms model=${stats.model ?? "none"}`
+      `search=${stats.searchMs ?? 0}ms gemini=${stats.geminiMs ?? 0}ms ai=${stats.aiMs ?? 0}ms provider=${stats.provider ?? "none"}`
     );
     res.setHeader("X-Alice-Timing", timingHeader(stats, Date.now() - startedAt, safeError?.message));
     return res.status(200).json(aliceResponse(errorForUser(safeError), false, oldHistory));
   }
 }
 
-export { aliceResponse, fitAliceText, isSearchIntent, modelChain, safeHistory };
+export { aliceResponse, aiConfig, fitAliceText, isSearchIntent, modelChain, safeHistory };
