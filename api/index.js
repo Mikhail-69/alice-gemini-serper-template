@@ -153,18 +153,31 @@ async function askGemini(text, history, searchContext, timeoutMs) {
 
   for (const model of models) {
     const startedAt = Date.now();
-    const { response, data } = await fetchJson(
-      `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`,
-      {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          "x-goog-api-key": key
+    let result;
+    try {
+      result = await fetchJson(
+        `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`,
+        {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            "x-goog-api-key": key
+          },
+          body: requestBody
         },
-        body: requestBody
-      },
-      Math.min(GEMINI_TIMEOUT_MS, budget)
-    );
+        Math.min(GEMINI_TIMEOUT_MS, budget)
+      );
+    } catch (networkError) {
+      if (networkError?.name !== "AbortError") throw networkError;
+      console.warn("Gemini attempt timed out on", model);
+      lastError = Object.assign(new Error("TIME_BUDGET_EXHAUSTED"), {
+        detail: `модель ${model} не ответила за отведённое время`
+      });
+      budget = 0;
+      break;
+    }
+
+    const { response, data } = result;
 
     budget -= Date.now() - startedAt;
 
@@ -274,7 +287,10 @@ export default async function handler(req, res) {
 
     return res.status(200).json(aliceResponse(answer, false, history));
   } catch (error) {
-    const safeError = error?.message === "AbortError" ? "TIME_BUDGET_EXHAUSTED" : error;
+    // Keep a real Error object here: a bare string would break the mapping in errorForUser.
+    const safeError = error?.name === "AbortError" || error?.message === "AbortError"
+      ? Object.assign(new Error("TIME_BUDGET_EXHAUSTED"), { detail: "превышено время ответа" })
+      : error;
     console.warn("Alice webhook returned a fallback response:", safeError?.message || "unknown error");
     return res.status(200).json(aliceResponse(errorForUser(safeError), false, oldHistory));
   }
