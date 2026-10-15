@@ -8,9 +8,9 @@ const RETRYABLE_STATUSES = new Set([404, 429, 500, 502, 503, 504]);
 const MAX_HISTORY_MESSAGES = 8;
 const MAX_HISTORY_MESSAGE_CHARS = 1200;
 const MAX_ALICE_TEXT = 1024;
-const TOTAL_RESPONSE_BUDGET_MS = 4300;
+const TOTAL_RESPONSE_BUDGET_MS = 3200;
 const SERPER_TIMEOUT_MS = 650;
-const GEMINI_TIMEOUT_MS = 3400;
+const GEMINI_TIMEOUT_MS = 2300;
 
 const SYSTEM_PROMPT = [
   "Ты — умная Алиса. Отвечай голосом: по-русски, 1–3 коротких предложения, без списков, таблиц и разметки.",
@@ -122,6 +122,11 @@ async function searchWeb(query, timeoutMs, stats) {
   }
 }
 
+function looksBroken(text) {
+  if (!text) return true;
+  return /правила:|коротких предложения|отвечай голосом|no lists|short sentences|не используй markdown/i.test(text);
+}
+
 function modelChain() {
   const configured = String(process.env.GEMINI_MODEL || DEFAULT_MODEL).trim();
   return [configured, ...FALLBACK_MODELS]
@@ -227,6 +232,14 @@ async function askGemini(text, history, searchContext, timeoutMs, stats) {
         if (data?.promptFeedback?.blockReason) throw new Error("GEMINI_BLOCKED");
         throw new Error("GEMINI_EMPTY_RESPONSE");
       }
+      if (looksBroken(answer)) {
+        console.warn("Gemini echoed the system prompt on", model, "; trying the next model");
+        lastError = Object.assign(new Error("GEMINI_REQUEST_FAILED"), {
+          detail: `модель ${model} вернула некорректный ответ`
+        });
+        if (budget < 500) break;
+        continue;
+      }
       if (stats) {
         stats.geminiMs = Date.now() - startedAt;
         stats.model = model;
@@ -309,14 +322,14 @@ export default async function handler(req, res) {
     let searchContext = "";
     if (isSearchIntent(text) && process.env.SERPER_API_KEY) {
       // Search has a very short budget because Alice expects a response within 4.5 seconds.
-      searchContext = await searchWeb(text, Math.min(SERPER_TIMEOUT_MS, Math.max(0, remainingMs() - 2600)), stats);
+      searchContext = await searchWeb(text, Math.min(SERPER_TIMEOUT_MS, Math.max(0, remainingMs() - 2200)), stats);
     }
 
     const answer = await askGemini(
       text,
       oldHistory,
       searchContext,
-      Math.max(0, Math.min(GEMINI_TIMEOUT_MS, remainingMs() - 600)),
+      Math.max(0, Math.min(GEMINI_TIMEOUT_MS, remainingMs() - 300)),
       stats
     );
 
