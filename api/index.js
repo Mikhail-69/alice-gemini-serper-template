@@ -354,6 +354,10 @@ export default async function handler(req, res) {
       safeError?.message || "unknown error",
       `search=${stats.searchMs ?? 0}ms gemini=${stats.geminiMs ?? 0}ms model=${stats.model ?? "none"}`
     );
+    res.setHeader(
+      "X-Alice-Timing",
+      `search=${stats.searchMs ?? 0}ms gemini=${stats.geminiMs ?? 0}ms model=${stats.model ?? "none"} thinking=${stats.thinkingLevel ?? "n/a"} total=${Date.now() - startedAt}ms`
+    );
     return res.status(200).json(aliceResponse(errorForUser(safeError), false, oldHistory));
   }
 }
