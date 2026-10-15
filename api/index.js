@@ -1,8 +1,7 @@
 const DEFAULT_MODEL = "gemini-3.6-flash";
 const FALLBACK_MODELS = ["gemini-3.8-flash", "gemini-3.5-flash-lite"];
 const MAX_OUTPUT_TOKENS = 400;
-const THINKING_LEVEL_HISTORY = "low";
-const THINKING_LEVEL_SINGLE = "minimal";
+const THINKING_LEVEL = "low";
 // Free-tier rate limits are tracked per model, so a 429 is worth retrying elsewhere.
 const RETRYABLE_STATUSES = new Set([404, 429, 500, 502, 503, 504]);
 const MAX_HISTORY_MESSAGES = 8;
@@ -134,6 +133,23 @@ function modelChain() {
     .filter((model, index, list) => list.indexOf(model) === index);
 }
 
+const HEADER_SAFE = /[^\x20-\x7E]/g;
+
+function timingHeader(stats, totalMs, errorMessage) {
+  const parts = [
+    `total=${totalMs}ms`,
+    `search=${stats.searchMs ?? 0}ms`,
+    `gemini=${stats.geminiMs ?? 0}ms`,
+    `tried=${stats.tried ?? "none"}`,
+    `status=${stats.lastStatus ?? "-"}`,
+    `thinking=${stats.thinkingLevel ?? "n/a"}`
+  ];
+  if (errorMessage) parts.push(`err=${errorMessage}`);
+  if (stats.lastDetail) parts.push(`detail=${stats.lastDetail}`);
+  // Header values must stay printable ASCII, otherwise the platform rejects them.
+  return parts.join(" ").replace(HEADER_SAFE, "?").slice(0, 900);
+}
+
 async function askGemini(text, history, searchContext, timeoutMs, stats) {
   const key = process.env.GEMINI_API_KEY;
   if (!key) throw new Error("MISSING_GEMINI_KEY");
@@ -154,23 +170,19 @@ async function askGemini(text, history, searchContext, timeoutMs, stats) {
 
   // Thinking is on by default in Gemini 3 and shares maxOutputTokens with the answer,
   // so a small cap silently truncates the reply down to a stub.
-  // Single-turn questions can think minimally; follow-ups need thought signatures,
-  // which we do not store, so they stay on the low level.
-  const thinkingLevel = contents.length > 1 ? THINKING_LEVEL_HISTORY : THINKING_LEVEL_SINGLE;
-
   const buildBody = thinking => JSON.stringify({
     systemInstruction: { parts: [{ text: SYSTEM_PROMPT }] },
     contents,
     generationConfig: {
       temperature: 0.5,
       maxOutputTokens: MAX_OUTPUT_TOKENS,
-      ...(thinking ? { thinkingConfig: { thinkingLevel } } : {})
+      ...(thinking ? { thinkingConfig: { thinkingLevel: THINKING_LEVEL } } : {})
     }
   });
 
   const call = async (model, thinking, timeout) => {
     try {
-      const result = await fetchJson(
+      const { response, data } = await fetchJson(
         `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`,
         {
           method: "POST",
@@ -182,22 +194,24 @@ async function askGemini(text, history, searchContext, timeoutMs, stats) {
         },
         timeout
       );
-      return { result };
+      return {
+        ok: response.ok,
+        status: Number(response.status),
+        detail: String(data?.error?.message || "").slice(0, 200),
+        answer: response.ok
+          ? (data?.candidates?.[0]?.content?.parts || [])
+              .filter(part => !part?.thought)
+              .map(part => (typeof part.text === "string" ? part.text : ""))
+              .join("")
+              .trim()
+          : "",
+        blocked: Boolean(data?.promptFeedback?.blockReason)
+      };
     } catch (networkError) {
       if (networkError?.name !== "AbortError") throw networkError;
       return { timeout: true };
     }
   };
-
-  const answerFrom = data => (data?.candidates?.[0]?.content?.parts || [])
-    .filter(part => !part?.thought)
-    .map(part => (typeof part.text === "string" ? part.text : ""))
-    .join("")
-    .trim();
-
-  const timedOut = model => Object.assign(new Error("TIME_BUDGET_EXHAUSTED"), {
-    detail: `модель ${model} не ответила за отведённое время`
-  });
 
   let thinking = true;
   let budget = timeoutMs;
@@ -212,68 +226,69 @@ async function askGemini(text, history, searchContext, timeoutMs, stats) {
     tried.push(model);
     let attempt = await call(model, thinking, limit());
 
-    // One retry without the thinking config in case this model rejects the field.
-    if (!attempt.timeout && !attempt.result.response.ok && attempt.result.response.status === 400 && thinking) {
+    // Retry once without the thinking config, but only when the model complained about it.
+    if (!attempt.timeout && attempt.status === 400 && thinking && /thinking/i.test(attempt.detail)) {
       thinking = false;
       console.warn("Gemini rejected thinkingConfig, retrying", model, "without it");
       attempt = await call(model, thinking, limit());
     }
 
     budget -= spent();
+    if (stats) stats.tried = tried.join(">");
+
     if (attempt.timeout) {
-      lastError = timedOut(model);
+      lastError = Object.assign(new Error("TIME_BUDGET_EXHAUSTED"), {
+        detail: `модель ${model} не ответила за отведённое время`
+      });
       if (stats) {
-        stats.tried = tried.join(">");
         stats.lastStatus = "timeout";
-        stats.lastDetail = `${model} не ответил за ${Math.round(spent())}ms`;
+        stats.lastDetail = lastError.detail;
       }
       budget = 0;
       break;
     }
 
-    const { response, data } = attempt.result;
-
-    if (response.ok) {
-      const answer = answerFrom(data);
-      if (!answer) {
-        if (data?.promptFeedback?.blockReason) throw new Error("GEMINI_BLOCKED");
+    if (attempt.ok) {
+      if (!attempt.answer) {
+        if (attempt.blocked) throw new Error("GEMINI_BLOCKED");
         throw new Error("GEMINI_EMPTY_RESPONSE");
       }
-      if (looksBroken(answer)) {
+      if (looksBroken(attempt.answer)) {
         console.warn("Gemini echoed the system prompt on", model, "; trying the next model");
         lastError = Object.assign(new Error("GEMINI_REQUEST_FAILED"), {
           detail: `модель ${model} вернула некорректный ответ`
         });
+        if (stats) {
+          stats.lastStatus = "broken";
+          stats.lastDetail = lastError.detail;
+        }
         if (budget < 500) break;
         continue;
       }
       if (stats) {
-        stats.geminiMs = Date.now() - startedAt;
+        stats.geminiMs = spent();
         stats.model = model;
-        stats.tried = tried.join(">");
-        stats.thinkingLevel = thinking ? thinkingLevel : "off";
+        stats.thinkingLevel = thinking ? THINKING_LEVEL : "off";
       }
-      return answer;
+      return attempt.answer;
     }
 
-    const status = Number(response.status);
-    const detail = String(data?.error?.message || "").slice(0, 200);
+    console.error("Gemini request failed with HTTP", attempt.status, "on model", model, attempt.detail);
     if (stats) {
-      stats.tried = tried.join(">");
-      stats.lastStatus = status;
-      stats.lastDetail = detail;
+      stats.lastStatus = attempt.status;
+      stats.lastDetail = attempt.detail;
     }
-    console.error("Gemini request failed with HTTP", status, "on model", model, detail);
-    if (status === 401 || status === 403) throw new Error("GEMINI_KEY_REJECTED");
 
-    lastError = status === 429
+    if (attempt.status === 401 || attempt.status === 403) throw new Error("GEMINI_KEY_REJECTED");
+
+    lastError = attempt.status === 429
       ? new Error("GEMINI_QUOTA")
       : Object.assign(new Error("GEMINI_REQUEST_FAILED"), {
-          detail: `HTTP ${status} на ${model}${detail ? `: ${detail}` : ""}`
+          detail: `HTTP ${attempt.status} на ${model}${attempt.detail ? `: ${attempt.detail}` : ""}`
         });
 
-    // Overloaded or temporarily unavailable model: try the next one in the chain.
-    if (!RETRYABLE_STATUSES.has(status)) break;
+    // Overloaded or throttled model: try the next one in the chain.
+    if (!RETRYABLE_STATUSES.has(attempt.status)) break;
     if (budget < 500) break;
   }
 
@@ -352,10 +367,7 @@ export default async function handler(req, res) {
       { role: "model", text: answer.slice(0, MAX_HISTORY_MESSAGE_CHARS) }
     ].slice(-MAX_HISTORY_MESSAGES);
 
-    res.setHeader(
-      "X-Alice-Timing",
-      `search=${stats.searchMs ?? 0}ms gemini=${stats.geminiMs ?? 0}ms model=${stats.model ?? "none"} thinking=${stats.thinkingLevel ?? "n\/a"} total=${Date.now() - startedAt}ms`
-    );
+    res.setHeader("X-Alice-Timing", timingHeader(stats, Date.now() - startedAt));
     return res.status(200).json(aliceResponse(answer, false, history));
   } catch (error) {
     // Keep a real Error object here: a bare string would break the mapping in errorForUser.
@@ -367,10 +379,7 @@ export default async function handler(req, res) {
       safeError?.message || "unknown error",
       `search=${stats.searchMs ?? 0}ms gemini=${stats.geminiMs ?? 0}ms model=${stats.model ?? "none"}`
     );
-    res.setHeader(
-      "X-Alice-Timing",
-      `search=${stats.searchMs ?? 0}ms gemini=${stats.geminiMs ?? 0}ms tried=${stats.tried ?? "none"} status=${stats.lastStatus ?? "-"} thinking=${stats.thinkingLevel ?? "n/a"} total=${Date.now() - startedAt}ms err=${safeError?.message ?? "?"} detail=${(stats.lastDetail ?? "").slice(0, 120)}`
-    );
+    res.setHeader("X-Alice-Timing", timingHeader(stats, Date.now() - startedAt, safeError?.message));
     return res.status(200).json(aliceResponse(errorForUser(safeError), false, oldHistory));
   }
 }
