@@ -152,10 +152,13 @@ async function askGemini(text, history, searchContext, timeoutMs) {
 
   if (!response.ok) {
     const status = Number(response.status);
-    console.error("Gemini request failed with HTTP", status);
+    const detail = String(data?.error?.message || "").slice(0, 200);
+    console.error("Gemini request failed with HTTP", status, detail);
     if (status === 401 || status === 403) throw new Error("GEMINI_KEY_REJECTED");
     if (status === 429) throw new Error("GEMINI_QUOTA");
-    throw new Error("GEMINI_REQUEST_FAILED");
+    throw Object.assign(new Error("GEMINI_REQUEST_FAILED"), {
+      detail: `HTTP ${status}${detail ? `: ${detail}` : ""}`
+    });
   }
 
   const candidate = data?.candidates?.[0];
@@ -187,8 +190,11 @@ function errorForUser(error) {
     case "TIME_BUDGET_EXHAUSTED":
     case "AbortError":
       return "Не успела подготовить ответ. Попробуйте задать вопрос ещё раз, чуть короче.";
-    default:
-      return "Не получилось получить ответ от нейросети. Попробуйте ещё раз чуть позже.";
+    default: {
+      const base = "Не получилось получить ответ от нейросети. Попробуйте ещё раз чуть позже.";
+      const detail = String(error?.detail || "").trim();
+      return detail ? `${base} Код ошибки: ${detail}` : base;
+    }
   }
 }
 
