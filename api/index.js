@@ -1,4 +1,6 @@
 const DEFAULT_MODEL = "gemini-3.5-flash-lite";
+const FALLBACK_MODELS = ["gemini-3.6-flash", "gemini-3.8-flash"];
+const RETRYABLE_STATUSES = new Set([404, 500, 502, 503, 504]);
 const MAX_HISTORY_MESSAGES = 8;
 const MAX_HISTORY_MESSAGE_CHARS = 1200;
 const MAX_ALICE_TEXT = 1024;
@@ -112,13 +114,20 @@ async function searchWeb(query, timeoutMs) {
   }
 }
 
+function modelChain() {
+  const configured = String(process.env.GEMINI_MODEL || DEFAULT_MODEL).trim();
+  return [configured, ...FALLBACK_MODELS]
+    .filter(model => /^[A-Za-z0-9._-]+$/.test(model))
+    .filter((model, index, list) => list.indexOf(model) === index);
+}
+
 async function askGemini(text, history, searchContext, timeoutMs) {
   const key = process.env.GEMINI_API_KEY;
   if (!key) throw new Error("MISSING_GEMINI_KEY");
   if (timeoutMs < 250) throw new Error("TIME_BUDGET_EXHAUSTED");
 
-  const model = String(process.env.GEMINI_MODEL || DEFAULT_MODEL).trim();
-  if (!/^[A-Za-z0-9._-]+$/.test(model)) throw new Error("INVALID_MODEL_NAME");
+  const models = modelChain();
+  if (models.length === 0) throw new Error("INVALID_MODEL_NAME");
 
   const contents = safeHistory(history).map(item => ({
     role: item.role,
@@ -130,51 +139,68 @@ async function askGemini(text, history, searchContext, timeoutMs) {
     : text;
   contents.push({ role: "user", parts: [{ text: prompt }] });
 
-  const { response, data } = await fetchJson(
-    `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`,
-    {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "x-goog-api-key": key
-      },
-      body: JSON.stringify({
-        systemInstruction: { parts: [{ text: SYSTEM_PROMPT }] },
-        contents,
-        generationConfig: {
-          temperature: 0.5,
-          maxOutputTokens: 240
-        }
-      })
-    },
-    Math.min(GEMINI_TIMEOUT_MS, timeoutMs)
-  );
+  const requestBody = JSON.stringify({
+    systemInstruction: { parts: [{ text: SYSTEM_PROMPT }] },
+    contents,
+    generationConfig: {
+      temperature: 0.5,
+      maxOutputTokens: 240
+    }
+  });
 
-  if (!response.ok) {
+  let lastError;
+  let budget = timeoutMs;
+
+  for (const model of models) {
+    const startedAt = Date.now();
+    const { response, data } = await fetchJson(
+      `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`,
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "x-goog-api-key": key
+        },
+        body: requestBody
+      },
+      Math.min(GEMINI_TIMEOUT_MS, budget)
+    );
+
+    budget -= Date.now() - startedAt;
+
+    if (response.ok) {
+      const candidate = data?.candidates?.[0];
+      const answer = (candidate?.content?.parts || [])
+        .map(part => (typeof part.text === "string" ? part.text : ""))
+        .join("")
+        .trim();
+
+      if (!answer) {
+        if (data?.promptFeedback?.blockReason) throw new Error("GEMINI_BLOCKED");
+        throw new Error("GEMINI_EMPTY_RESPONSE");
+      }
+      if (candidate?.finishReason === "MAX_TOKENS") {
+        console.warn("Gemini reached the output token limit on", model);
+      }
+      return answer;
+    }
+
     const status = Number(response.status);
     const detail = String(data?.error?.message || "").slice(0, 200);
-    console.error("Gemini request failed with HTTP", status, detail);
+    console.error("Gemini request failed with HTTP", status, "on model", model, detail);
     if (status === 401 || status === 403) throw new Error("GEMINI_KEY_REJECTED");
     if (status === 429) throw new Error("GEMINI_QUOTA");
-    throw Object.assign(new Error("GEMINI_REQUEST_FAILED"), {
-      detail: `HTTP ${status}${detail ? `: ${detail}` : ""}`
+
+    lastError = Object.assign(new Error("GEMINI_REQUEST_FAILED"), {
+      detail: `HTTP ${status} на ${model}${detail ? `: ${detail}` : ""}`
     });
+
+    // Overloaded or temporarily unavailable model: try the next one in the chain.
+    if (!RETRYABLE_STATUSES.has(status)) break;
+    if (budget < 500) break;
   }
 
-  const candidate = data?.candidates?.[0];
-  const answer = (candidate?.content?.parts || [])
-    .map(part => typeof part.text === "string" ? part.text : "")
-    .join("")
-    .trim();
-
-  if (!answer) {
-    if (data?.promptFeedback?.blockReason) throw new Error("GEMINI_BLOCKED");
-    throw new Error("GEMINI_EMPTY_RESPONSE");
-  }
-  if (candidate?.finishReason === "MAX_TOKENS") {
-    console.warn("Gemini reached the output token limit.");
-  }
-  return answer;
+  throw lastError || new Error("GEMINI_REQUEST_FAILED");
 }
 
 function errorForUser(error) {
@@ -254,4 +280,4 @@ export default async function handler(req, res) {
   }
 }
 
-export { aliceResponse, fitAliceText, isSearchIntent, safeHistory };
+export { aliceResponse, fitAliceText, isSearchIntent, modelChain, safeHistory };
