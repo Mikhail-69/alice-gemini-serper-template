@@ -315,7 +315,13 @@ function aiConfig() {
 async function askCompatibleAI(text, history, searchContext, timeoutMs, stats) {
   const { key, baseUrl, model } = aiConfig();
   if (!key) throw new Error("MISSING_AI_KEY");
-  if (!/^https:\/\//i.test(baseUrl) || !/^[A-Za-z0-9._:/-]+$/.test(model)) {
+  let parsedBaseUrl;
+  try {
+    parsedBaseUrl = new URL(baseUrl);
+  } catch {
+    parsedBaseUrl = null;
+  }
+  if (parsedBaseUrl?.protocol !== "https:" || !model || model.length > 200) {
     throw new Error("INVALID_AI_CONFIG");
   }
   if (timeoutMs < 250) throw new Error("TIME_BUDGET_EXHAUSTED");
