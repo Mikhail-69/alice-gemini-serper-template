@@ -1,5 +1,7 @@
-const DEFAULT_MODEL = "gemini-3.5-flash-lite";
-const FALLBACK_MODELS = ["gemini-3.6-flash", "gemini-3.8-flash"];
+const DEFAULT_MODEL = "gemini-3.6-flash";
+const FALLBACK_MODELS = ["gemini-3.8-flash", "gemini-3.5-flash-lite"];
+const MAX_OUTPUT_TOKENS = 600;
+const THINKING_LEVEL = "low";
 const RETRYABLE_STATUSES = new Set([404, 500, 502, 503, 504]);
 const MAX_HISTORY_MESSAGES = 8;
 const MAX_HISTORY_MESSAGE_CHARS = 1200;
@@ -139,23 +141,21 @@ async function askGemini(text, history, searchContext, timeoutMs) {
     : text;
   contents.push({ role: "user", parts: [{ text: prompt }] });
 
-  const requestBody = JSON.stringify({
+  // Thinking is on by default in Gemini 3 and shares maxOutputTokens with the answer,
+  // so a small cap silently truncates the reply down to a stub.
+  const buildBody = thinking => JSON.stringify({
     systemInstruction: { parts: [{ text: SYSTEM_PROMPT }] },
     contents,
     generationConfig: {
       temperature: 0.5,
-      maxOutputTokens: 240
+      maxOutputTokens: MAX_OUTPUT_TOKENS,
+      ...(thinking ? { thinkingConfig: { thinkingLevel: THINKING_LEVEL } } : {})
     }
   });
 
-  let lastError;
-  let budget = timeoutMs;
-
-  for (const model of models) {
-    const startedAt = Date.now();
-    let result;
+  const call = async (model, thinking, timeout) => {
     try {
-      result = await fetchJson(
+      const result = await fetchJson(
         `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`,
         {
           method: "POST",
@@ -163,37 +163,59 @@ async function askGemini(text, history, searchContext, timeoutMs) {
             "Content-Type": "application/json",
             "x-goog-api-key": key
           },
-          body: requestBody
+          body: buildBody(thinking)
         },
-        Math.min(GEMINI_TIMEOUT_MS, budget)
+        timeout
       );
+      return { result };
     } catch (networkError) {
       if (networkError?.name !== "AbortError") throw networkError;
-      console.warn("Gemini attempt timed out on", model);
-      lastError = Object.assign(new Error("TIME_BUDGET_EXHAUSTED"), {
-        detail: `модель ${model} не ответила за отведённое время`
-      });
+      return { timeout: true };
+    }
+  };
+
+  const answerFrom = data => (data?.candidates?.[0]?.content?.parts || [])
+    .filter(part => !part?.thought)
+    .map(part => (typeof part.text === "string" ? part.text : ""))
+    .join("")
+    .trim();
+
+  const timedOut = model => Object.assign(new Error("TIME_BUDGET_EXHAUSTED"), {
+    detail: `модель ${model} не ответила за отведённое время`
+  });
+
+  let thinking = true;
+  let budget = timeoutMs;
+  let lastError;
+
+  for (const model of models) {
+    const startedAt = Date.now();
+    const spent = () => Date.now() - startedAt;
+    const limit = () => Math.min(GEMINI_TIMEOUT_MS, Math.max(0, budget - spent()));
+
+    let attempt = await call(model, thinking, limit());
+
+    // One retry without the thinking config in case this model rejects the field.
+    if (!attempt.timeout && !attempt.result.response.ok && attempt.result.response.status === 400 && thinking) {
+      thinking = false;
+      console.warn("Gemini rejected thinkingConfig, retrying", model, "without it");
+      attempt = await call(model, thinking, limit());
+    }
+
+    budget -= spent();
+    if (attempt.timeout) {
+      lastError = timedOut(model);
       budget = 0;
       break;
     }
 
-    const { response, data } = result;
-
-    budget -= Date.now() - startedAt;
+    const { response, data } = attempt.result;
 
     if (response.ok) {
-      const candidate = data?.candidates?.[0];
-      const answer = (candidate?.content?.parts || [])
-        .map(part => (typeof part.text === "string" ? part.text : ""))
-        .join("")
-        .trim();
-
+      const answer = answerFrom(data);
       if (!answer) {
         if (data?.promptFeedback?.blockReason) throw new Error("GEMINI_BLOCKED");
         throw new Error("GEMINI_EMPTY_RESPONSE");
-      }
-      if (candidate?.finishReason === "MAX_TOKENS") {
-        console.warn("Gemini reached the output token limit on", model);
       }
       return answer;
     }
