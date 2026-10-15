@@ -315,7 +315,7 @@ function aiConfig() {
 async function askCompatibleAI(text, history, searchContext, timeoutMs, stats) {
   const { key, baseUrl, model } = aiConfig();
   if (!key) throw new Error("MISSING_AI_KEY");
-  if (!/^https:\/\//i.test(baseUrl) || !/^[A-Za-z0-9._:-]+$/.test(model)) {
+  if (!/^https:\/\//i.test(baseUrl) || !/^[A-Za-z0-9._:/-]+$/.test(model)) {
     throw new Error("INVALID_AI_CONFIG");
   }
   if (timeoutMs < 250) throw new Error("TIME_BUDGET_EXHAUSTED");
